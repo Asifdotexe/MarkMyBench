@@ -16,12 +16,13 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
-# NOTE: Load .env early at module level so that OPENAI_API_KEY is available
-# before any class is instantiated. This avoids subtle failures where the key
-# is present in the shell but not forwarded into the Poetry virtualenv.
-load_dotenv()
+# NOTE: The .env file lives inside rag_vs_pageindex/ (not the repo root) because
+# this benchmark is a self-contained module. We resolve the path relative to this
+# file so the pipeline can be invoked from any working directory.
+_ENV_PATH = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=_ENV_PATH)
 
 # NOTE: We intentionally keep parsing logic for both PDF and HTML in this
 # single module. SEC EDGAR 10-K filings are served as HTML pages, while
@@ -63,6 +64,11 @@ class TraditionalRAGPipeline:
         self._embedder = OpenAIEmbeddings(model=model)
         self._index: faiss.IndexFlatIP | None = None
         self._chunks: list[str] = []
+
+        # NOTE: Temperature is set to 0 for full determinism. Benchmark answers
+        # must be reproducible across runs — any stochastic variation would make
+        # Context Precision / Recall metrics incomparable between pipeline types.
+        self._llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
         # Warm-start: if a previous run already built the index, reload it
         # so the caller does not have to re-embed the entire corpus.
@@ -295,10 +301,44 @@ class TraditionalRAGPipeline:
 
     def generate_answer(self, query: str, context: list[str]) -> str:
         """
-        Generates an answer using an LLM based on the provided context.
+        Generates a grounded answer using GPT-4o, strictly based on the provided
+        context passages retrieved from the FAISS index.
 
-        :param query: The user query.
-        :param context: The context chunks retrieved from the vector database.
+        The system prompt instructs the model to answer only from the given context
+        and to explicitly state when the answer cannot be determined. This reduces
+        hallucinations and makes the output more suitable for RAGAS evaluation,
+        where faithfulness to retrieved context is a key metric.
+
+        :param query: The natural-language question to answer.
+        :param context: Retrieved text passages from the FAISS index.
+        :raises ValueError: If ``context`` is empty.
         """
-        # TODO: Implement LLM generation logic.
-        pass
+        if not context:
+            raise ValueError("Cannot generate an answer without context passages.")
+
+        # NOTE: We join context chunks with a numbered list rather than a single
+        # blob of text. This helps the model distinguish between separate passages
+        # and reduces the risk of it blending unrelated facts into one sentence.
+        formatted_context = "\n\n".join(
+            f"[{i + 1}] {chunk}" for i, chunk in enumerate(context)
+        )
+
+        messages = [
+            (
+                "system",
+                (
+                    "You are a precise research assistant. "
+                    "Answer the user's question using ONLY the context passages provided below. "
+                    "If the answer cannot be found in the context, respond with: "
+                    "'I could not find a relevant answer in the provided context.' "
+                    "Do not speculate or add information beyond what is in the context."
+                ),
+            ),
+            (
+                "human",
+                f"Context passages:\n{formatted_context}\n\nQuestion: {query}",
+            ),
+        ]
+
+        response = self._llm.invoke(messages)
+        return response.content
