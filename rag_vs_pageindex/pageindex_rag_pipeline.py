@@ -5,6 +5,7 @@ This module provides the foundation for the PageIndex (Vectorless RAG)
 approach. It processes documents into hierarchical semantic trees and
 utilizes LLM-driven navigation for context extraction.
 """
+import json
 import os
 import pickle
 import re
@@ -136,20 +137,111 @@ class PageIndexPipeline:
         """
         Navigates the semantic tree using an LLM to extract relevant context.
 
+        Instead of vector similarity, the LLM reads a compact "Table of Contents"
+        built from the node summaries and decides which sections are most likely
+        to contain the answer. This is the core differentiator of the PageIndex
+        approach: retrieval is driven by reasoning, not by embedding distance.
+
         :param query: The user query to evaluate against the tree.
         :param tree: The hierarchical semantic tree representation of the document.
+        :raises RuntimeError: If the tree is empty (no documents have been indexed yet).
         """
+        nodes = tree.get("nodes", [])
+        if not nodes:
+            raise RuntimeError(
+                "Semantic tree is empty. Run generate_semantic_tree() first."
+            )
+
+        # NOTE: We deliberately exclude the heavy raw `content` from this prompt.
+        # Sending only the summaries keeps the token count low and forces the LLM
+        # to make a routing decision based on high-level topic relevance, which is
+        # the fundamental idea behind PageIndex.
+        toc_lines = [
+            f"[{node['id']}] {node['summary']}" for node in nodes
+        ]
+        toc_text = "\n".join(toc_lines)
+
+        messages = [
+            (
+                "system",
+                (
+                    "You are a document retrieval router. You will be given a Table of "
+                    "Contents where each entry has an integer ID and a one-sentence summary. "
+                    "Your task is to select the IDs of the sections most likely to contain "
+                    "information relevant to the user's question.\n\n"
+                    "Rules:\n"
+                    "- Return ONLY a JSON array of integer IDs, e.g. [1, 4, 7].\n"
+                    "- Select between 1 and 5 sections (prefer fewer if the question is narrow).\n"
+                    "- Do NOT include any explanation, markdown, or extra text."
+                ),
+            ),
+            (
+                "human",
+                f"Table of Contents:\n{toc_text}\n\nQuestion: {query}",
+            ),
+        ]
+
+        response = self._llm.invoke(messages).content.strip()
+
+        # NOTE: The LLM sometimes wraps the JSON in a markdown code-fence.
+        # We strip that defensively before parsing.
+
+        cleaned = response
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        selected_ids: list[int] = json.loads(cleaned)
+
+        # Build a fast lookup from node ID -> full content text.
+        id_to_content = {node["id"]: node["content"] for node in nodes}
+
         # FIXME: LLM-driven navigation might become a bottleneck under heavy loads.
         # Consider implementing caching strategies for repetitive or similar queries.
-        # TODO: Implement reasoning-based tree traversal logic to find relevant paths.
-        pass
+        return [
+            id_to_content[nid]
+            for nid in selected_ids
+            if nid in id_to_content
+        ]
 
     def generate_answer(self, query: str, context: list[str]) -> str:
         """
-        Generates a concise answer based on the context extracted from the tree.
+        Generates a grounded answer using Gemini 2.5 Flash, strictly based on
+        the context sections extracted via tree navigation.
+
+        The system prompt mirrors the Traditional RAG pipeline's generation step
+        to ensure a fair, apples-to-apples benchmarking comparison between the
+        two retrieval strategies.
 
         :param query: The user query.
         :param context: The context strings extracted via tree navigation.
+        :raises ValueError: If ``context`` is empty.
         """
-        # TODO: Implement final generation step based on tree-derived context.
-        pass
+        if not context:
+            raise ValueError("Cannot generate an answer without context passages.")
+
+        # NOTE: We number the context passages so the model can distinguish between
+        # separate sections and avoid blending unrelated facts into one sentence.
+        formatted_context = "\n\n".join(
+            f"[{i + 1}] {passage}" for i, passage in enumerate(context)
+        )
+
+        messages = [
+            (
+                "system",
+                (
+                    "You are a precise research assistant. "
+                    "Answer the user's question using ONLY the context passages provided below. "
+                    "If the answer cannot be found in the context, respond with: "
+                    "'I could not find a relevant answer in the provided context.' "
+                    "Do not speculate or add information beyond what is in the context."
+                ),
+            ),
+            (
+                "human",
+                f"Context passages:\n{formatted_context}\n\nQuestion: {query}",
+            ),
+        ]
+
+        response = self._llm.invoke(messages)
+        return response.content
