@@ -1,40 +1,157 @@
 """
 Traditional RAG Pipeline Module.
 
-This module provides the structural foundation for the Traditional 
-Retrieval-Augmented Generation (RAG) approach, including parsing, 
-chunking, embedding, and similarity search logic.
+This module provides the Traditional Retrieval-Augmented Generation (RAG)
+approach, including parsing, chunking, embedding, and similarity search logic.
 """
 
+from pathlib import Path
+
+import pdfplumber
+import requests
+from bs4 import BeautifulSoup
+
+# NOTE: We intentionally keep parsing logic for both PDF and HTML in this
+# single module. SEC EDGAR 10-K filings are served as HTML pages, while
+# the NIST document is a standard PDF. Rather than forcing the caller to
+# pre-process files into a single format, we detect format at runtime —
+# this keeps the benchmark self-contained and reduces setup friction.
+_SUPPORTED_EXTENSIONS = {".pdf"}
+_HTML_URL_PREFIXES = ("http://", "https://")
 
 
 class TraditionalRAGPipeline:
     """
     Pipeline for executing a Traditional RAG workflow.
+
+    Supports both local PDF files and remote HTML URLs (e.g., SEC EDGAR)
+    as document sources. Internally handles format detection, text extraction,
+    chunking, embedding, and FAISS-based retrieval.
     """
 
     def __init__(self, db_path: str = "./faiss_db") -> None:
         """
         Initializes the pipeline with necessary configurations.
 
-        :param db_path: Path to the local vector database instance.
+        :param db_path: Path to the local FAISS vector database index file.
         """
         self.db_path = db_path
-        # TODO: Initialize embedding model and vector database client here.
+        # TODO: Initialize embedding model and FAISS index client here.
 
-    def ingest_document(self, file_path: str) -> str:
+    def ingest_document(self, source: str) -> str:
         """
-        Ingests a PDF document and extracts its raw text.
+        Ingests a document from either a local PDF path or a remote HTML URL
+        and returns the extracted plain text.
 
-        :param file_path: The absolute or relative path to the PDF document.
+        Routes to the appropriate parser based on input type:
+        - Local ``*.pdf`` files  → ``pdfplumber``
+        - HTTP/HTTPS URLs        → ``requests`` + ``BeautifulSoup``
+
+        :param source: A local file path (PDF) or a full HTTP/HTTPS URL pointing
+                       to an HTML document (e.g., an SEC EDGAR filing page).
+        :raises FileNotFoundError: If a local path is given but does not exist.
+        :raises ValueError: If the file extension is unsupported for local paths.
+        :raises requests.HTTPError: If the HTTP request for a URL source fails.
         """
-        # NOTE: Using a robust parser is essential here as financial documents 
-        # may contain complex formatting and nested tables.
-        # This prevents data loss in the evaluation phase.
-        # TODO: Implement PDF parsing logic.
-        pass
+        if source.startswith(_HTML_URL_PREFIXES):
+            return self._parse_html_url(source)
 
-    def chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> list[str]:
+        # Treat anything that is not a URL as a local filesystem path.
+        return self._parse_pdf(source)
+
+    def _parse_pdf(self, file_path: str) -> str:
+        """
+        Extracts plain text from a local PDF file using ``pdfplumber``.
+
+        ``pdfplumber`` is chosen over alternatives (e.g., ``pypdf``) because
+        it handles complex PDF layouts — including multi-column text and embedded
+        tables found in financial 10-K filings — significantly more reliably.
+
+        :param file_path: Absolute or relative path to the ``.pdf`` file.
+        :raises FileNotFoundError: If the file does not exist at the given path.
+        :raises ValueError: If the file does not have a ``.pdf`` extension.
+        """
+        path = Path(file_path)
+
+        if not path.exists():
+            raise FileNotFoundError(f"Document not found at path: '{file_path}'")
+
+        if path.suffix.lower() not in _SUPPORTED_EXTENSIONS:
+            raise ValueError(
+                f"Unsupported file type '{path.suffix}'. "
+                f"Only the following extensions are supported: {_SUPPORTED_EXTENSIONS}"
+            )
+
+        # NOTE: We join page text with double newlines to preserve section
+        # boundaries between pages. This matters during chunking — a naive
+        # single-space join would bleed unrelated paragraphs into the same chunk.
+        extracted_pages: list[str] = []
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    extracted_pages.append(page_text.strip())
+
+        return "\n\n".join(extracted_pages)
+
+    def _parse_html_url(self, url: str) -> str:
+        """
+        Fetches an HTML page from a URL and extracts its visible body text.
+
+        Designed for SEC EDGAR HTML filings, which expose the full 10-K document
+        as a single enriched HTML page. BeautifulSoup with the ``lxml`` backend
+        is used for speed and robust handling of malformed HTML tags that are
+        common in the older EDGAR filing format.
+
+        :param url: A valid HTTP or HTTPS URL pointing to an HTML document.
+        :raises requests.HTTPError: If the server returns a non-2xx status code.
+        """
+        # NOTE: We set a realistic browser User-Agent here to avoid SEC EDGAR's
+        # bot-detection returning a 403 Forbidden response. This is a standard
+        # courtesy header, not a deceptive practice.
+        headers = {
+            "User-Agent": (
+                "MarkMyBench/0.1 Benchmarking Research Tool "
+                "(Academic Use; contact: asifdotexe@gmail.com)"
+            )
+        }
+
+        response = requests.get(url, headers=headers, timeout=30)
+
+        # Raise immediately on any HTTP error (4xx, 5xx) so the caller
+        # gets an explicit error rather than silently parsing an error page.
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, "lxml")
+
+        # Remove non-content tags before extracting text to avoid polluting
+        # the corpus with navigation menus, scripts, and inline styles.
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+
+        # get_text() with a separator preserves line breaks from block elements.
+        raw_text = soup.get_text(separator="\n")
+
+        # Collapse excessive blank lines (4+ consecutive) into a single blank line.
+        # Financial HTML filings often have large whitespace gaps around tables.
+        lines = raw_text.splitlines()
+        cleaned_lines: list[str] = []
+        blank_streak = 0
+        for line in lines:
+            if line.strip():
+                blank_streak = 0
+                cleaned_lines.append(line.strip())
+            else:
+                blank_streak += 1
+                # Allow a maximum of one blank separator line between sections.
+                if blank_streak <= 1:
+                    cleaned_lines.append("")
+
+        return "\n".join(cleaned_lines)
+
+    def chunk_text(
+        self, text: str, chunk_size: int = 1000, overlap: int = 200
+    ) -> list[str]:
         """
         Splits the raw text into manageable chunks for embedding.
 
@@ -51,9 +168,9 @@ class TraditionalRAGPipeline:
 
         :param chunks: A list of text chunks to be embedded.
         """
-        # NOTE: Storing vectors locally (e.g., FAISS) reduces latency and API costs 
+        # NOTE: Storing vectors locally (e.g., FAISS) reduces latency and API costs
         # during frequent benchmarking runs, improving reproducibility.
-        # TODO: Implement embedding generation and database storage logic.
+        # TODO: Implement embedding generation and FAISS index storage logic.
         pass
 
     def retrieve_context(self, query: str, top_k: int = 5) -> list[str]:
@@ -63,9 +180,9 @@ class TraditionalRAGPipeline:
         :param query: The user query to search for.
         :param top_k: The number of topmost relevant chunks to return.
         """
-        # FIXME: Context retrieval might need reranking if standard cosine similarity 
+        # FIXME: Context retrieval might need reranking if standard cosine similarity
         # yields poor results for highly nuanced queries.
-        # TODO: Implement cosine similarity search.
+        # TODO: Implement cosine similarity search via FAISS index.
         pass
 
     def generate_answer(self, query: str, context: list[str]) -> str:
