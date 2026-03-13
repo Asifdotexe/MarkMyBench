@@ -15,7 +15,7 @@ Anyone reproducing the results must use these same documents to ensure a fair co
 
 | # | Document | Type | Source |
 |---|----------|------|--------|
-| 1 | Rocket Lab USA 2024 Annual Report (10-K) | SEC Filing (HTML) | [SEC EDGAR](https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=RKLB&type=10-K&dateb=&owner=include&count=10) |
+| 1 | Rocket Lab USA 2024 Annual Report (10-K) | SEC Filing (HTML) | [SEC EDGAR](https://www.sec.gov/Archives/edgar/data/1819994/000162828025008724/rklb-20241231.htm) |
 | 2 | NIST Cybersecurity Framework 2.0 | Official PDF | [NIST](https://nvlpubs.nist.gov/nistpubs/CSWP/NIST.CSWP.29.pdf) |
 | 3 | Oracle Corporation FY2024 Annual Report (10-K) | SEC Filing (HTML) | [SEC EDGAR](https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=ORCL&type=10-K&dateb=&owner=include&count=10) |
 

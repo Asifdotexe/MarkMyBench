@@ -41,13 +41,13 @@ class TraditionalRAGPipeline:
     chunking, embedding, and FAISS-based retrieval.
     """
 
-    def __init__(self, db_path: str = "./faiss_db", model: str = "models/text-embedding-004") -> None:
+    def __init__(self, db_path: str = "./faiss_db", model: str = "models/gemini-embedding-2-preview") -> None:
         """
         Initialises the pipeline and, if a persisted index already exists at
         ``db_path``, loads it into memory to avoid redundant re-embedding.
 
         :param db_path: Directory where the FAISS index and chunk list are saved.
-        :param model: The Gemini embedding model to use (default: text-embedding-004).
+        :param model: The Gemini embedding model to use (default: models/gemini-embedding-2-preview).
         """
         self.db_path = Path(db_path)
         self.db_path.mkdir(parents=True, exist_ok=True)
@@ -63,7 +63,7 @@ class TraditionalRAGPipeline:
         # NOTE: Temperature is set to 0 for full determinism. Benchmark answers
         # must be reproducible across runs — any stochastic variation would make
         # Context Precision / Recall metrics incomparable between pipeline types.
-        self._llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+        self._llm = ChatGoogleGenerativeAI(model="models/gemini-2.5-flash", temperature=0)
 
         # Warm-start: if a previous run already built the index, reload it
         # so the caller does not have to re-embed the entire corpus.

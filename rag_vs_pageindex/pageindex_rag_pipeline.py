@@ -29,7 +29,7 @@ class PageIndexPipeline:
     Pipeline for executing a Vectorless PageIndex workflow.
     """
 
-    def __init__(self, db_path: str = "./pageindex_db", model: str = "gemini-2.5-flash") -> None:
+    def __init__(self, db_path: str = "./pageindex_db", model: str = "models/gemini-2.5-flash") -> None:
         """
         Initializes the pipeline with necessary configurations for tree construction.
 
