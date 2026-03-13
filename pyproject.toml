@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "markmybench"
+version = "0.1.0"
+description = "A quantitative and qualitative benchmarking analysis repository for various different things"
+authors = ["Asif Sayyed <asifdotexe@gmail.com>"]
+readme = "README.md"
+packages = [{ include = "rag_vs_pageindex" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+pandas = "^2.0.0"
+python-dotenv = "^1.0.0"
+
+[tool.poetry.group.benchmark_rag_pageindex.dependencies]
+langchain = "^0.1.0"
+chromadb = "^0.4.0"
+ragas = "^0.1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
