@@ -5,12 +5,23 @@ This module provides the Traditional Retrieval-Augmented Generation (RAG)
 approach, including parsing, chunking, embedding, and similarity search logic.
 """
 
+import os
+import pickle
 from pathlib import Path
 
+import faiss
+import numpy as np
 import pdfplumber
 import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+
+# NOTE: Load .env early at module level so that OPENAI_API_KEY is available
+# before any class is instantiated. This avoids subtle failures where the key
+# is present in the shell but not forwarded into the Poetry virtualenv.
+load_dotenv()
 
 # NOTE: We intentionally keep parsing logic for both PDF and HTML in this
 # single module. SEC EDGAR 10-K filings are served as HTML pages, while
@@ -19,6 +30,10 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 # this keeps the benchmark self-contained and reduces setup friction.
 _SUPPORTED_EXTENSIONS = {".pdf"}
 _HTML_URL_PREFIXES = ("http://", "https://")
+
+# File names used under db_path to persist the index and chunk text.
+_INDEX_FILE = "faiss.index"
+_CHUNKS_FILE = "chunks.pkl"
 
 
 class TraditionalRAGPipeline:
@@ -30,14 +45,33 @@ class TraditionalRAGPipeline:
     chunking, embedding, and FAISS-based retrieval.
     """
 
-    def __init__(self, db_path: str = "./faiss_db") -> None:
+    def __init__(self, db_path: str = "./faiss_db", model: str = "text-embedding-3-small") -> None:
         """
-        Initializes the pipeline with necessary configurations.
+        Initialises the pipeline and, if a persisted index already exists at
+        ``db_path``, loads it into memory to avoid redundant re-embedding.
 
-        :param db_path: Path to the local FAISS vector database index file.
+        :param db_path: Directory where the FAISS index and chunk list are saved.
+        :param model: OpenAI embedding model name. Defaults to ``text-embedding-3-small``
         """
-        self.db_path = db_path
-        # TODO: Initialize embedding model and FAISS index client here.
+        self.db_path = Path(db_path)
+        self.db_path.mkdir(parents=True, exist_ok=True)
+
+        # NOTE: We store both the FAISS index and the raw chunk strings on disk.
+        # FAISS only stores float vectors; it has no concept of the original text.
+        # The chunk list is the lookup table that maps a FAISS result index back
+        # to the actual passage we want to return to the LLM.
+        self._embedder = OpenAIEmbeddings(model=model)
+        self._index: faiss.IndexFlatIP | None = None
+        self._chunks: list[str] = []
+
+        # Warm-start: if a previous run already built the index, reload it
+        # so the caller does not have to re-embed the entire corpus.
+        index_file = self.db_path / _INDEX_FILE
+        chunks_file = self.db_path / _CHUNKS_FILE
+        if index_file.exists() and chunks_file.exists():
+            self._index = faiss.read_index(str(index_file))
+            with open(chunks_file, "rb") as fh:
+                self._chunks = pickle.load(fh)
 
     def ingest_document(self, source: str) -> str:
         """
@@ -192,28 +226,72 @@ class TraditionalRAGPipeline:
         # This can happen at the tail end of documents with trailing whitespace.
         return [chunk for chunk in chunks if chunk.strip()]
 
-    def embed_and_store(self, chunks: list[str]) -> bool:
+    def embed_and_store(self, chunks: list[str]) -> None:
         """
-        Generates embeddings for the provided chunks and stores them in the vector database.
+        Generates OpenAI embeddings for the provided text chunks and adds them
+        to the in-memory FAISS index, then persists both index and chunk list to disk.
 
-        :param chunks: A list of text chunks to be embedded.
+        This method is additive, calling it multiple times with different
+        document chunks accumulates all chunks into the same index. This lets
+        you index several documents sequentially without rebuilding from scratch.
+
+        Uses ``IndexFlatIP`` (Inner Product) over ``IndexFlatL2`` (Euclidean)
+        because OpenAI embeddings are L2-normalised, making inner product
+        equivalent to cosine similarity, the metric recommended for text retrieval.
+
+        :param chunks: Non-empty list of text chunks to embed and index.
+        :raises ValueError: If ``chunks`` is empty.
         """
-        # NOTE: Storing vectors locally (e.g., FAISS) reduces latency and API costs
-        # during frequent benchmarking runs, improving reproducibility.
-        # TODO: Implement embedding generation and FAISS index storage logic.
-        pass
+        if not chunks:
+            raise ValueError("Cannot embed an empty chunk list.")
+
+        # NOTE: embed_documents returns a list[list[float]], one vector per chunk.
+        # We convert to a float32 numpy array because FAISS requires contiguous
+        # float32 arrays (not Python lists or float64).
+        raw_vectors = self._embedder.embed_documents(chunks)
+        vectors = np.array(raw_vectors, dtype=np.float32)
+
+        # Lazily initialise the FAISS index on the first call, using the actual
+        # embedding dimension rather than hardcoding it. This lets us swap models
+        # without breaking the index creation logic.
+        if self._index is None:
+            dimension = vectors.shape[1]
+            self._index = faiss.IndexFlatIP(dimension)
+
+        self._index.add(vectors)
+        self._chunks.extend(chunks)
+
+        # Persist to disk after every batch so that a partial run is recoverable.
+        faiss.write_index(self._index, str(self.db_path / _INDEX_FILE))
+        with open(self.db_path / _CHUNKS_FILE, "wb") as fh:
+            pickle.dump(self._chunks, fh)
 
     def retrieve_context(self, query: str, top_k: int = 5) -> list[str]:
         """
-        Retrieves the most relevant document chunks based on cosine similarity to the query.
+        Embeds the query and retrieves the ``top_k`` most relevant chunks from
+        the FAISS index using inner-product (cosine) similarity.
 
-        :param query: The user query to search for.
-        :param top_k: The number of topmost relevant chunks to return.
+        :param query: The natural-language question to search for.
+        :param top_k: Number of top-matching chunks to return.
+        :raises RuntimeError: If the index is empty (no documents have been indexed yet).
         """
-        # FIXME: Context retrieval might need reranking if standard cosine similarity
-        # yields poor results for highly nuanced queries.
-        # TODO: Implement cosine similarity search via FAISS index.
-        pass
+        if self._index is None or self._index.ntotal == 0:
+            raise RuntimeError(
+                "FAISS index is empty. Run embed_and_store() before retrieve_context()."
+            )
+
+        query_vector = np.array(
+            [self._embedder.embed_query(query)], dtype=np.float32
+        )
+
+        # FIXME: Pure cosine similarity may rank verbose chunks higher than
+        # precise ones. Consider adding a reciprocal-rank-fusion reranking step
+        # once baseline metrics are established.
+        _, indices = self._index.search(query_vector, top_k)
+
+        # FAISS returns -1 for unfilled slots when the index has fewer than top_k
+        # entries — filter those out to avoid an IndexError on self._chunks.
+        return [self._chunks[i] for i in indices[0] if i != -1]
 
     def generate_answer(self, query: str, context: list[str]) -> str:
         """
