@@ -15,8 +15,8 @@ import pdfplumber
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # NOTE: The .env file lives inside rag_vs_pageindex/ (not the repo root) because
 # this benchmark is a self-contained module. We resolve the path relative to this
@@ -46,13 +46,13 @@ class TraditionalRAGPipeline:
     chunking, embedding, and FAISS-based retrieval.
     """
 
-    def __init__(self, db_path: str = "./faiss_db", model: str = "text-embedding-3-small") -> None:
+    def __init__(self, db_path: str = "./faiss_db", model: str = "models/text-embedding-004") -> None:
         """
         Initialises the pipeline and, if a persisted index already exists at
         ``db_path``, loads it into memory to avoid redundant re-embedding.
 
         :param db_path: Directory where the FAISS index and chunk list are saved.
-        :param model: OpenAI embedding model name. Defaults to ``text-embedding-3-small``
+        :param model: The Gemini embedding model to use (default: text-embedding-004).
         """
         self.db_path = Path(db_path)
         self.db_path.mkdir(parents=True, exist_ok=True)
@@ -61,14 +61,14 @@ class TraditionalRAGPipeline:
         # FAISS only stores float vectors; it has no concept of the original text.
         # The chunk list is the lookup table that maps a FAISS result index back
         # to the actual passage we want to return to the LLM.
-        self._embedder = OpenAIEmbeddings(model=model)
+        self._embedder = GoogleGenerativeAIEmbeddings(model=model)
         self._index: faiss.IndexFlatIP | None = None
         self._chunks: list[str] = []
 
         # NOTE: Temperature is set to 0 for full determinism. Benchmark answers
         # must be reproducible across runs — any stochastic variation would make
         # Context Precision / Recall metrics incomparable between pipeline types.
-        self._llm = ChatOpenAI(model="gpt-4o", temperature=0)
+        self._llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
 
         # Warm-start: if a previous run already built the index, reload it
         # so the caller does not have to re-embed the entire corpus.
@@ -234,7 +234,7 @@ class TraditionalRAGPipeline:
 
     def embed_and_store(self, chunks: list[str]) -> None:
         """
-        Generates OpenAI embeddings for the provided text chunks and adds them
+        Generates Gemini embeddings for the provided text chunks and adds them
         to the in-memory FAISS index, then persists both index and chunk list to disk.
 
         This method is additive, calling it multiple times with different
@@ -242,7 +242,7 @@ class TraditionalRAGPipeline:
         you index several documents sequentially without rebuilding from scratch.
 
         Uses ``IndexFlatIP`` (Inner Product) over ``IndexFlatL2`` (Euclidean)
-        because OpenAI embeddings are L2-normalised, making inner product
+        because Gemini embeddings are typically L2-normalised, making inner product
         equivalent to cosine similarity, the metric recommended for text retrieval.
 
         :param chunks: Non-empty list of text chunks to embed and index.
@@ -301,7 +301,7 @@ class TraditionalRAGPipeline:
 
     def generate_answer(self, query: str, context: list[str]) -> str:
         """
-        Generates a grounded answer using GPT-4o, strictly based on the provided
+        Generates a grounded answer using Gemini 2.5 Flash, strictly based on the provided
         context passages retrieved from the FAISS index.
 
         The system prompt instructs the model to answer only from the given context
