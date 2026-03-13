@@ -112,6 +112,11 @@ ipython_config.py
 .pdm-build/
 .personal/
 
+# Benchmark raw data files - download from DATA_SOURCES.md, do not commit
+data/
+*.pdf
+install_log*.txt
+
 # PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
 __pypackages__/
 
