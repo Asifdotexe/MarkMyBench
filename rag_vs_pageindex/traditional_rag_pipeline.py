@@ -10,6 +10,7 @@ from pathlib import Path
 import pdfplumber
 import requests
 from bs4 import BeautifulSoup
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # NOTE: We intentionally keep parsing logic for both PDF and HTML in this
 # single module. SEC EDGAR 10-K filings are served as HTML pages, while
@@ -153,14 +154,43 @@ class TraditionalRAGPipeline:
         self, text: str, chunk_size: int = 1000, overlap: int = 200
     ) -> list[str]:
         """
-        Splits the raw text into manageable chunks for embedding.
+        Splits raw document text into overlapping chunks suitable for embedding.
+
+        Uses LangChain's ``RecursiveCharacterTextSplitter`` with a natural-language
+        separator hierarchy: paragraph → line → word → character. This preserves
+        semantic coherence as long as possible before falling back to hard cuts,
+        which is critical for financial documents where sentences within a paragraph
+        often share critical context (e.g., risk factors, footnotes).
 
         :param text: The raw text extracted from the document.
-        :param chunk_size: The maximum number of characters per chunk.
-        :param overlap: The number of overlapping characters between chunks.
+        :param chunk_size: Maximum number of characters per chunk.
+        :param overlap: Number of overlapping characters between consecutive chunks.
+                        Overlap prevents losing context that straddles a chunk boundary
+                        (e.g., a key term defined at the end of one chunk being referenced
+                        at the start of the next).
+        :raises ValueError: If ``text`` is empty or whitespace-only.
         """
-        # TODO: Implement recursive character splitting or similar logic.
-        pass
+        if not text or not text.strip():
+            raise ValueError("Cannot chunk empty or whitespace-only text.")
+
+        # NOTE: The separator list is ordered from coarsest to finest granularity.
+        # The splitter works left-to-right: it tries each separator in turn and
+        # only moves to a finer split if the current chunk still exceeds chunk_size.
+        # Double-newline (paragraph) → newline (line) → space (word) → "" (character).
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=overlap,
+            # "\n\n"  →  "\n"  →  " "  →  ""
+            # paragraph     line    word   char
+            separators=["\n\n", "\n", " ", ""],
+            length_function=len,
+        )
+
+        chunks = splitter.split_text(text)
+
+        # NOTE: Filter out any chunks that are effectively empty after splitting.
+        # This can happen at the tail end of documents with trailing whitespace.
+        return [chunk for chunk in chunks if chunk.strip()]
 
     def embed_and_store(self, chunks: list[str]) -> bool:
         """
