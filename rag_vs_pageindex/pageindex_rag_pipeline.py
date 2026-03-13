@@ -12,18 +12,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-import pdfplumber
-import requests
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 # NOTE: Load .env explicitly from the benchmark directory
 _ENV_PATH = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=_ENV_PATH)
-
-_SUPPORTED_EXTENSIONS = {".pdf"}
-_HTML_URL_PREFIXES = ("http://", "https://")
 
 # Default paths for saving the PageIndex tree
 _TREE_FILE = "pageindex_tree.pkl"
@@ -61,74 +55,13 @@ class PageIndexPipeline:
 
         These explicit tags are the backbone of the PageIndex approach — they demarcate
         the natural semantic boundaries of the document which the LLM will later summarize.
+        
+        Delegates to the shared `document_parsers` module with `keep_structure=True`.
 
         :param source: A local file path (PDF) or a full HTTP/HTTPS URL (HTML).
         """
-        if source.startswith(_HTML_URL_PREFIXES):
-            return self._parse_html_url(source)
-        return self._parse_pdf(source)
-
-    def _parse_pdf(self, file_path: str) -> str:
-        """
-        Extracts text from a local PDF, wrapping each page's content in `<page_N>` tags.
-        """
-        path = Path(file_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Document not found at: '{file_path}'")
-        if path.suffix.lower() not in _SUPPORTED_EXTENSIONS:
-            raise ValueError(f"Unsupported file type '{path.suffix}'.")
-
-        extracted_nodes: list[str] = []
-        with pdfplumber.open(path) as pdf:
-            for page_num, page in enumerate(pdf.pages, start=1):
-                page_text = page.extract_text()
-                if page_text and page_text.strip():
-                    # NOTE: We inject explicit structural boundaries here.
-                    node_content = (
-                        f"<page_{page_num}>\n"
-                        f"{page_text.strip()}\n"
-                        f"</page_{page_num}>"
-                    )
-                    extracted_nodes.append(node_content)
-
-        return "\n\n".join(extracted_nodes)
-
-    def _parse_html_url(self, url: str) -> str:
-        """
-        Fetches an HTML page and extracts text, grouping lines into logical sections
-        wrapped in `<section_N>` tags to simulate page boundaries.
-        """
-        headers = {
-            "User-Agent": "MarkMyBench/0.1 (Academic Use; asifdotexe@gmail.com)"
-        }
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-
-        soup = BeautifulSoup(response.content, "lxml")
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
-            tag.decompose()
-
-        raw_text = soup.get_text(separator="\n")
-        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
-
-        # NOTE: Since HTML lacks natural "pages", we group text into coarse sections
-        # of ~50 lines (roughly equivalent to a printed page) and wrap them.
-        # This prevents the LLM from having to summarize an entire 10-K report in one go.
-        extracted_nodes: list[str] = []
-        section_num = 1
-        lines_per_section = 50
-
-        for i in range(0, len(lines), lines_per_section):
-            section_text = "\n".join(lines[i : i + lines_per_section])
-            node_content = (
-                f"<section_{section_num}>\n"
-                f"{section_text}\n"
-                f"</section_{section_num}>"
-            )
-            extracted_nodes.append(node_content)
-            section_num += 1
-
-        return "\n\n".join(extracted_nodes)
+        from rag_vs_pageindex.document_parsers import ingest_document as parser_ingest
+        return parser_ingest(source, keep_structure=True)
 
     def generate_semantic_tree(self, text: str) -> dict[str, Any]:
         """

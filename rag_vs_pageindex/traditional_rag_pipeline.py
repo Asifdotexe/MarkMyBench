@@ -11,9 +11,6 @@ from pathlib import Path
 
 import faiss
 import numpy as np
-import pdfplumber
-import requests
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -29,8 +26,6 @@ load_dotenv(dotenv_path=_ENV_PATH)
 # the NIST document is a standard PDF. Rather than forcing the caller to
 # pre-process files into a single format, we detect format at runtime —
 # this keeps the benchmark self-contained and reduces setup friction.
-_SUPPORTED_EXTENSIONS = {".pdf"}
-_HTML_URL_PREFIXES = ("http://", "https://")
 
 # File names used under db_path to persist the index and chunk text.
 _INDEX_FILE = "faiss.index"
@@ -83,112 +78,12 @@ class TraditionalRAGPipeline:
         """
         Ingests a document from either a local PDF path or a remote HTML URL
         and returns the extracted plain text.
-
-        Routes to the appropriate parser based on input type:
-        - Local ``*.pdf`` files  → ``pdfplumber``
-        - HTTP/HTTPS URLs        → ``requests`` + ``BeautifulSoup``
-
-        :param source: A local file path (PDF) or a full HTTP/HTTPS URL pointing
-                       to an HTML document (e.g., an SEC EDGAR filing page).
-        :raises FileNotFoundError: If a local path is given but does not exist.
-        :raises ValueError: If the file extension is unsupported for local paths.
-        :raises requests.HTTPError: If the HTTP request for a URL source fails.
+        
+        Delegates to the shared `document_parsers` module. Keep structure is False
+        to ensure raw text is returned for standard arbitrary chunking.
         """
-        if source.startswith(_HTML_URL_PREFIXES):
-            return self._parse_html_url(source)
-
-        # Treat anything that is not a URL as a local filesystem path.
-        return self._parse_pdf(source)
-
-    def _parse_pdf(self, file_path: str) -> str:
-        """
-        Extracts plain text from a local PDF file using ``pdfplumber``.
-
-        ``pdfplumber`` is chosen over alternatives (e.g., ``pypdf``) because
-        it handles complex PDF layouts — including multi-column text and embedded
-        tables found in financial 10-K filings — significantly more reliably.
-
-        :param file_path: Absolute or relative path to the ``.pdf`` file.
-        :raises FileNotFoundError: If the file does not exist at the given path.
-        :raises ValueError: If the file does not have a ``.pdf`` extension.
-        """
-        path = Path(file_path)
-
-        if not path.exists():
-            raise FileNotFoundError(f"Document not found at path: '{file_path}'")
-
-        if path.suffix.lower() not in _SUPPORTED_EXTENSIONS:
-            raise ValueError(
-                f"Unsupported file type '{path.suffix}'. "
-                f"Only the following extensions are supported: {_SUPPORTED_EXTENSIONS}"
-            )
-
-        # NOTE: We join page text with double newlines to preserve section
-        # boundaries between pages. This matters during chunking — a naive
-        # single-space join would bleed unrelated paragraphs into the same chunk.
-        extracted_pages: list[str] = []
-        with pdfplumber.open(path) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    extracted_pages.append(page_text.strip())
-
-        return "\n\n".join(extracted_pages)
-
-    def _parse_html_url(self, url: str) -> str:
-        """
-        Fetches an HTML page from a URL and extracts its visible body text.
-
-        Designed for SEC EDGAR HTML filings, which expose the full 10-K document
-        as a single enriched HTML page. BeautifulSoup with the ``lxml`` backend
-        is used for speed and robust handling of malformed HTML tags that are
-        common in the older EDGAR filing format.
-
-        :param url: A valid HTTP or HTTPS URL pointing to an HTML document.
-        :raises requests.HTTPError: If the server returns a non-2xx status code.
-        """
-        # NOTE: We set a realistic browser User-Agent here to avoid SEC EDGAR's
-        # bot-detection returning a 403 Forbidden response. This is a standard
-        # courtesy header, not a deceptive practice.
-        headers = {
-            "User-Agent": (
-                "MarkMyBench/0.1 Benchmarking Research Tool "
-                "(Academic Use; contact: asifdotexe@gmail.com)"
-            )
-        }
-
-        response = requests.get(url, headers=headers, timeout=30)
-
-        # Raise immediately on any HTTP error (4xx, 5xx) so the caller
-        # gets an explicit error rather than silently parsing an error page.
-        response.raise_for_status()
-
-        soup = BeautifulSoup(response.content, "lxml")
-
-        # Remove non-content tags before extracting text to avoid polluting
-        # the corpus with navigation menus, scripts, and inline styles.
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
-            tag.decompose()
-
-        # get_text() with a separator preserves line breaks from block elements.
-        raw_text = soup.get_text(separator="\n")
-
-        # Collapse excessive blank lines (4+ consecutive) into a single blank line.
-        # Financial HTML filings often have large whitespace gaps around tables.
-        lines = raw_text.splitlines()
-        cleaned_lines: list[str] = []
-        blank_streak = 0
-        for line in lines:
-            if line.strip():
-                blank_streak = 0
-                cleaned_lines.append(line.strip())
-            else:
-                blank_streak += 1
-                # Allow a maximum of one blank separator line between sections.
-                if blank_streak <= 1:
-                    cleaned_lines.append("")
-
-        return "\n".join(cleaned_lines)
+        from rag_vs_pageindex.document_parsers import ingest_document as parser_ingest
+        return parser_ingest(source, keep_structure=False)
 
     def chunk_text(
         self, text: str, chunk_size: int = 1000, overlap: int = 200
